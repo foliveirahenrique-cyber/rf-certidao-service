@@ -1,7 +1,8 @@
-// server.js (com correções e melhorias para cookies + seletores + clique)
+// server.js (com cookies + emissão + download pelo link da página de resultado)
 
 const express = require("express");
 const { chromium } = require("playwright");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -40,15 +41,26 @@ app.post("/emitir-certidao", auth, async (req, res) => {
     const context = await browser.newContext({
       acceptDownloads: true,
       // userAgent opcional (às vezes ajuda com sites mais chatos)
-      // userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+      // userAgent:
+      //   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
     });
 
     const page = await context.newPage();
 
-    // --- helpers ---
+    // ---------------- Helpers ----------------
+
+    async function safeCount(locator) {
+      try {
+        return await locator.count();
+      } catch {
+        return 0;
+      }
+    }
+
     async function tryClickCookieButtons() {
       const candidates = [
         /aceitar/i,
+        /aceitar cookies/i,
         /aceitar todos/i,
         /concordo/i,
         /prosseguir/i,
@@ -58,7 +70,7 @@ app.post("/emitir-certidao", auth, async (req, res) => {
         /permitir/i,
       ];
 
-      // tenta por role button (melhor)
+      // tenta por role button
       for (const re of candidates) {
         try {
           const btn = page.getByRole("button", { name: re });
@@ -81,17 +93,110 @@ app.post("/emitir-certidao", auth, async (req, res) => {
           }
         } catch {}
       }
-    }
 
-    async function safeCount(locator) {
+      // fallback extra: qualquer botão com "Aceitar"
       try {
-        return await locator.count();
-      } catch {
-        return 0;
-      }
+        const btnAceitar = page.locator('button:has-text("Aceitar")');
+        if ((await btnAceitar.count().catch(() => 0)) > 0) {
+          await btnAceitar.first().click({ timeout: 1500 }).catch(() => {});
+          await page.waitForTimeout(300);
+        }
+      } catch {}
     }
 
-    // --- navegação ---
+    /**
+     * Tenta baixar o PDF a partir da página de resultado
+     * ("Resultado da Emissão de Certidão"), clicando no link de download.
+     * Retorna:
+     *  - { mode: "download", download } se disparar evento download
+     *  - { mode: "inline", buffer, fileName } se vier PDF inline (response application/pdf)
+     *  - null se não encontrar o link / não conseguir baixar
+     */
+    async function downloadFromResultPage() {
+      // o texto pode variar, então colocamos várias opções
+      const linkSelector =
+        'a:has-text("download do documento PDF"), a:has-text("download do documento PDF da certidão"), a:has-text("documento PDF da certidão"), a:has-text("documento PDF")';
+
+      const link = page.locator(linkSelector).first();
+      const hasLink = (await link.count().catch(() => 0)) > 0;
+
+      if (!hasLink) return null;
+
+      // tenta como download real
+      const dl = page
+        .waitForEvent("download", { timeout: 25000 })
+        .catch(() => null);
+
+      await link.click().catch(() => {});
+      const download = await dl;
+
+      if (download) {
+        return { mode: "download", download };
+      }
+
+      // fallback: às vezes abre PDF inline (sem download event)
+      const pdfResp = await page
+        .waitForResponse(
+          (r) => {
+            const ct = (r.headers()["content-type"] || "").toLowerCase();
+            return (
+              ct.includes("application/pdf") &&
+              r.status() >= 200 &&
+              r.status() < 300
+            );
+          },
+          { timeout: 25000 }
+        )
+        .catch(() => null);
+
+      if (!pdfResp) return null;
+
+      const buf = await pdfResp.body().catch(() => null);
+      if (!buf) return null;
+
+      return {
+        mode: "inline",
+        buffer: buf,
+        fileName: `certidao-${cnpj}-${Date.now()}.pdf`,
+      };
+    }
+
+    /**
+     * Normaliza saída "EMITIDA" salvando um download
+     */
+    async function respondWithDownload(download, msgPrefix) {
+      const fileName = await download.suggestedFilename();
+      const filePath = `/tmp/${cnpj}-${Date.now()}-${fileName}`;
+      await download.saveAs(filePath);
+
+      const pdfBase64 = fs.readFileSync(filePath).toString("base64");
+
+      await browser.close();
+      return res.status(200).json({
+        status: "EMITIDA",
+        message: msgPrefix,
+        fileName,
+        pdfBase64,
+      });
+    }
+
+    /**
+     * Normaliza saída "EMITIDA" salvando buffer inline
+     */
+    async function respondWithInlineBuffer(buffer, fileName, msgPrefix) {
+      const pdfBase64 = Buffer.from(buffer).toString("base64");
+
+      await browser.close();
+      return res.status(200).json({
+        status: "EMITIDA",
+        message: msgPrefix,
+        fileName: fileName || `certidao-${cnpj}-${Date.now()}.pdf`,
+        pdfBase64,
+      });
+    }
+
+    // ---------------- Navegação ----------------
+
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
     // cookies podem aparecer atrasados
@@ -138,40 +243,52 @@ app.post("/emitir-certidao", auth, async (req, res) => {
 
       const d2 = await dl2;
       if (d2) {
-        const fileName = await d2.suggestedFilename();
-        const filePath = `/tmp/${cnpj}-${Date.now()}-${fileName}`;
-        await d2.saveAs(filePath);
+        return await respondWithDownload(
+          d2,
+          "Emitida via modal (Emitir Nova Certidão) - download automático"
+        );
+      }
 
-        const fs = require("fs");
-        const pdfBase64 = fs.readFileSync(filePath).toString("base64");
-
-        await browser.close();
-        return res.status(200).json({
-          status: "EMITIDA",
-          message: "Emitida via modal (Emitir Nova Certidão)",
-          fileName,
-          pdfBase64,
-        });
+      // ✅ Se não baixou automaticamente, tenta baixar pelo link da página de resultado
+      const resultDl2 = await downloadFromResultPage();
+      if (resultDl2?.mode === "download") {
+        return await respondWithDownload(
+          resultDl2.download,
+          "Emitida via modal (Emitir Nova Certidão) - download pelo link do resultado"
+        );
+      }
+      if (resultDl2?.mode === "inline") {
+        return await respondWithInlineBuffer(
+          resultDl2.buffer,
+          resultDl2.fileName,
+          "Emitida via modal (Emitir Nova Certidão) - PDF capturado inline pelo resultado"
+        );
       }
     }
 
     // Caso normal (download direto após "Emitir Certidão")
     const d1 = await dl1;
     if (d1) {
-      const fileName = await d1.suggestedFilename();
-      const filePath = `/tmp/${cnpj}-${Date.now()}-${fileName}`;
-      await d1.saveAs(filePath);
+      return await respondWithDownload(
+        d1,
+        "Emitida via botão Emitir Certidão - download automático"
+      );
+    }
 
-      const fs = require("fs");
-      const pdfBase64 = fs.readFileSync(filePath).toString("base64");
-
-      await browser.close();
-      return res.status(200).json({
-        status: "EMITIDA",
-        message: "Emitida via botão Emitir Certidão",
-        fileName,
-        pdfBase64,
-      });
+    // ✅ Se não baixou automaticamente, tenta baixar pelo link da página de resultado
+    const resultDl1 = await downloadFromResultPage();
+    if (resultDl1?.mode === "download") {
+      return await respondWithDownload(
+        resultDl1.download,
+        "Emitida - download pelo link do resultado"
+      );
+    }
+    if (resultDl1?.mode === "inline") {
+      return await respondWithInlineBuffer(
+        resultDl1.buffer,
+        resultDl1.fileName,
+        "Emitida - PDF capturado inline pelo resultado"
+      );
     }
 
     // Sem download: provável pendência / fluxo diferente / bloqueio
