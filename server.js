@@ -123,26 +123,28 @@ app.post("/emitir-certidao", auth, async (req, res) => {
 
     // ✅ ESSA É A PARTE PRINCIPAL PARA O "SALVAR COMO"
     // Captura o PDF diretamente pela rede (application/pdf).
-    async function waitForPdfResponse(timeoutMs = 30000) {
-      const resp = await page
-        .waitForResponse(
-          (r) => {
-            const ct = (r.headers()["content-type"] || "").toLowerCase();
-            return (
-              ct.includes("application/pdf") &&
-              r.status() >= 200 &&
-              r.status() < 300
-            );
-          },
-          { timeout: timeoutMs }
-        )
-        .catch(() => null);
+    async function waitForPdfResponse(timeoutMs = 45000) {
+  const resp = await page.waitForResponse((r) => {
+    const headers = r.headers();
+    const ct = (headers["content-type"] || "").toLowerCase();
+    const cd = (headers["content-disposition"] || "").toLowerCase();
+    const url = (r.url() || "").toLowerCase();
 
-      if (!resp) return null;
-      const buf = await resp.body().catch(() => null);
-      if (!buf) return null;
-      return buf;
-    }
+    const looksLikePdfByType = ct.includes("application/pdf");
+    const looksLikeAttachmentPdf = cd.includes("attachment") && (cd.includes(".pdf") || cd.includes("pdf"));
+    const looksLikePdfByUrl = url.includes("pdf") || url.includes("certidao");
+
+    return (looksLikePdfByType || looksLikeAttachmentPdf || looksLikePdfByUrl)
+      && r.status() >= 200 && r.status() < 300;
+  }, { timeout: timeoutMs }).catch(() => null);
+
+  if (!resp) return null;
+
+  const buf = await resp.body().catch(() => null);
+  if (!buf || buf.length < 1000) return null; // evita capturar resposta pequena que não é PDF
+
+  return buf;
+}
 
     // Espera a página de "Resultado..." OU aparecer link de PDF
     async function waitForResultPageOrPdfLink() {
