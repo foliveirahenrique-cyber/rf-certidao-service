@@ -121,32 +121,38 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       });
     }
 
-    // ✅ ESSA É A PARTE PRINCIPAL PARA O "SALVAR COMO"
-    // Captura o PDF diretamente pela rede (application/pdf).
+    // ✅ Captura PDF pela rede (resolve “Salvar como”/PDF inline/attachment)
     async function waitForPdfResponse(timeoutMs = 45000) {
-  const resp = await page.waitForResponse((r) => {
-    const headers = r.headers();
-    const ct = (headers["content-type"] || "").toLowerCase();
-    const cd = (headers["content-disposition"] || "").toLowerCase();
-    const url = (r.url() || "").toLowerCase();
+      const resp = await page
+        .waitForResponse(
+          (r) => {
+            const headers = r.headers();
+            const ct = (headers["content-type"] || "").toLowerCase();
+            const cd = (headers["content-disposition"] || "").toLowerCase();
+            const u = (r.url() || "").toLowerCase();
 
-    const looksLikePdfByType = ct.includes("application/pdf");
-    const looksLikeAttachmentPdf = cd.includes("attachment") && (cd.includes(".pdf") || cd.includes("pdf"));
-    const looksLikePdfByUrl = url.includes("pdf") || url.includes("certidao");
+            const looksLikePdfByType = ct.includes("application/pdf");
+            const looksLikeAttachmentPdf =
+              cd.includes("attachment") && (cd.includes(".pdf") || cd.includes("pdf"));
+            const looksLikePdfByUrl = u.includes("pdf") || u.includes("certidao");
 
-    return (looksLikePdfByType || looksLikeAttachmentPdf || looksLikePdfByUrl)
-      && r.status() >= 200 && r.status() < 300;
-  }, { timeout: timeoutMs }).catch(() => null);
+            return (
+              (looksLikePdfByType || looksLikeAttachmentPdf || looksLikePdfByUrl) &&
+              r.status() >= 200 &&
+              r.status() < 300
+            );
+          },
+          { timeout: timeoutMs }
+        )
+        .catch(() => null);
 
-  if (!resp) return null;
+      if (!resp) return null;
 
-  const buf = await resp.body().catch(() => null);
-  if (!buf || buf.length < 1000) return null; // evita capturar resposta pequena que não é PDF
+      const buf = await resp.body().catch(() => null);
+      if (!buf || buf.length < 1000) return null;
+      return buf;
+    }
 
-  return buf;
-}
-
-    // Espera a página de "Resultado..." OU aparecer link de PDF
     async function waitForResultPageOrPdfLink() {
       const resultTitle = page.locator("text=Resultado da Emissão de Certidão");
       const pdfLinkByText = page.locator('a:has-text("PDF")');
@@ -162,7 +168,6 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       return false;
     }
 
-    // fallback: tentar baixar PDF via link da página de resultado
     async function downloadFromResultPage() {
       const linkCandidates = [
         page.getByRole("link", { name: /download.*pdf/i }),
@@ -192,7 +197,7 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       const d = await dl;
       if (d) return { mode: "download", download: d };
 
-      // 2) tentar baixar via href usando request do context (mantém cookies/sessão)
+      // 2) tentar baixar via href usando request do context
       const href = await link.getAttribute("href").catch(() => null);
       if (href) {
         const absolute = href.startsWith("http")
@@ -201,8 +206,11 @@ app.post("/emitir-certidao", auth, async (req, res) => {
 
         const resp = await context.request.get(absolute).catch(() => null);
         if (resp && resp.ok()) {
-          const ct = (resp.headers()["content-type"] || "").toLowerCase();
-          if (ct.includes("application/pdf")) {
+          const headers = resp.headers();
+          const ct = (headers["content-type"] || "").toLowerCase();
+          const cd = (headers["content-disposition"] || "").toLowerCase();
+
+          if (ct.includes("application/pdf") || cd.includes(".pdf") || cd.includes("attachment")) {
             const buf = await resp.body();
             return { mode: "buffer", buffer: buf, fileName: `Certidao-${cnpj}.pdf` };
           }
@@ -222,22 +230,79 @@ app.post("/emitir-certidao", auth, async (req, res) => {
     await tryClickCookieButtons();
     await page.waitForTimeout(800);
 
-    const inputSelector =
-      'input[placeholder*="CNPJ"], input[aria-label*="CNPJ"], input[inputmode="numeric"]';
-    await page.waitForSelector(inputSelector, { timeout: 20000 });
-    await page.fill(inputSelector, cnpj);
-    await page.waitForTimeout(300);
+    // ======== BLOCO ROBUSTO (substitui o antigo page.fill + page.click) ========
+    const cnpjDigits = cnpj;
 
-    const emitirSelector = 'button:has-text("Emitir Certidão")';
+    let cnpjInput = page.locator('input[placeholder*="CNPJ"]').first();
+    if ((await cnpjInput.count().catch(() => 0)) === 0) {
+      cnpjInput = page.locator('input[inputmode="numeric"]').first();
+    }
+    if ((await cnpjInput.count().catch(() => 0)) === 0) {
+      cnpjInput = page.locator("form input").first();
+    }
+
+    await cnpjInput.waitFor({ timeout: 20000 });
+    await cnpjInput.fill("");
+    await cnpjInput.type(cnpjDigits, { delay: 30 });
+    await cnpjInput.press("Tab").catch(() => {});
+    await page.waitForTimeout(400);
+
     await tryClickCookieButtons();
 
-    // tenta download automático (quando o site dispara download direto)
-    const dl1 = page
-      .waitForEvent("download", { timeout: 25000 })
+    const emitirBtn = page.getByRole("button", { name: /emitir certidão/i });
+    await emitirBtn.waitFor({ timeout: 20000 });
+    await emitirBtn.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+
+    const isDisabled =
+      (await emitirBtn.isDisabled().catch(() => false)) ||
+      (await emitirBtn.getAttribute("disabled").catch(() => null)) !== null;
+
+    if (isDisabled) {
+      await cnpjInput.focus().catch(() => {});
+      await cnpjInput.press("Tab").catch(() => {});
+      await page.waitForTimeout(500);
+    }
+
+    // ✅ dl1 tem que existir aqui (antes do clique), porque usamos depois
+    const dl1 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
+
+    await emitirBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    const modalPromise = page
+      .locator("text=Certidão Válida Encontrada")
+      .waitFor({ timeout: 15000 })
+      .then(() => "MODAL")
       .catch(() => null);
 
-    await page.click(emitirSelector).catch(() => {});
-    await page.waitForTimeout(1200);
+    const urlPromise = page
+      .waitForURL((u) => !u.toString().includes("#/home/cnpj"), { timeout: 15000 })
+      .then(() => "NAV")
+      .catch(() => null);
+
+    const outcome = await Promise.race([modalPromise, urlPromise]);
+
+    if (!outcome) {
+      const currentUrl = page.url();
+      const pageTitle = await page.title().catch(() => "");
+      const inputVal = await cnpjInput.inputValue().catch(() => "");
+      const btnDisabled2 = await emitirBtn.isDisabled().catch(() => null);
+      const bodyText = await page.textContent("body").catch(() => "");
+
+      await browser.close();
+      return res.status(200).json({
+        status: "NAO_EMITIDA",
+        message: "Não conseguiu acionar o clique em 'Emitir Certidão' (sem modal e sem navegação).",
+        fileName: "",
+        pdfBase64: "",
+        currentUrl,
+        pageTitle,
+        debug: { inputVal, btnDisabled: btnDisabled2 },
+        debugSnippet: (bodyText || "").slice(0, 2000),
+      });
+    }
+    // ======== FIM DO BLOCO ROBUSTO ========
 
     // modal “Certidão Válida Encontrada”
     const modalExists =
@@ -246,26 +311,17 @@ app.post("/emitir-certidao", auth, async (req, res) => {
     if (modalExists) {
       await tryClickCookieButtons();
 
-      // =========================================================
-      // ✅ AQUI está o que resolve o "SALVAR COMO":
-      // arma captura de PDF antes do clique (pela rede)
+      // ✅ arma captura de PDF antes do clique (resolve "Salvar como")
       const pdfPromise = waitForPdfResponse(45000);
 
-      // ainda tentamos download event (se por acaso o site disparar download)
-      const dl2 = page
-        .waitForEvent("download", { timeout: 25000 })
-        .catch(() => null);
+      // ainda tentamos download event
+      const dl2 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
 
-      // clica para emitir nova
-      await page
-        .click('button:has-text("Emitir Nova Certidão")')
-        .catch(() => {});
+      await page.click('button:has-text("Emitir Nova Certidão")').catch(() => {});
 
-      // espera a tela/links carregarem um pouco (SPA)
       await waitForResultPageOrPdfLink();
       await tryClickCookieButtons();
 
-      // 1) se veio download event, usa
       const d2 = await dl2;
       if (d2) {
         return await respondWithDownload(
@@ -274,7 +330,6 @@ app.post("/emitir-certidao", auth, async (req, res) => {
         );
       }
 
-      // 2) se veio PDF pela resposta (o mais comum no seu caso), usa
       const pdfBuf = await pdfPromise;
       if (pdfBuf) {
         return await respondWithBuffer(
@@ -284,7 +339,6 @@ app.post("/emitir-certidao", auth, async (req, res) => {
         );
       }
 
-      // 3) fallback: tentar baixar pelo link do resultado
       const resultDl2 = await downloadFromResultPage();
       if (resultDl2?.mode === "download") {
         return await respondWithDownload(
@@ -299,17 +353,15 @@ app.post("/emitir-certidao", auth, async (req, res) => {
           "Emitida via modal - PDF capturado via link/resultado"
         );
       }
-      // =========================================================
     }
 
-    // fluxo sem modal
+    // fluxo sem modal: se baixou automático ao clicar Emitir Certidão
     const d1 = await dl1;
     if (d1) return await respondWithDownload(d1, "Emitida - download automático");
 
     await waitForResultPageOrPdfLink();
     await tryClickCookieButtons();
 
-    // tenta capturar PDF por response mesmo fora do modal
     const pdfBufNoModal = await waitForPdfResponse(25000);
     if (pdfBufNoModal) {
       return await respondWithBuffer(
@@ -319,7 +371,6 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       );
     }
 
-    // fallback por link
     const resultDl1 = await downloadFromResultPage();
     if (resultDl1?.mode === "download")
       return await respondWithDownload(
@@ -333,7 +384,7 @@ app.post("/emitir-certidao", auth, async (req, res) => {
         "Emitida - PDF capturado via link/resultado"
       );
 
-    // diagnóstico
+    // diagnóstico final
     const bodyText = await page.textContent("body").catch(() => "");
     const currentUrl = page.url();
     const pageTitle = await page.title().catch(() => "");
