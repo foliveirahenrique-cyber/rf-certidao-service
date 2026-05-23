@@ -31,7 +31,12 @@ app.post("/emitir-certidao", auth, async (req, res) => {
   const url =
     "https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cnpj";
 
+  // ⬇️ parâmetros de retry (ajuste se quiser)
+  const MAX_ATTEMPTS = 2;        // tenta 2 vezes no erro temporário
+  const RETRY_WAIT_MS = 60000;   // espera 60s entre tentativas (o site pede “alguns minutos”)
+
   let browser;
+
   try {
     browser = await chromium.launch({ headless: true });
 
@@ -121,7 +126,7 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       });
     }
 
-    // ✅ Captura PDF pela rede (resolve “Salvar como”/PDF inline/attachment)
+    // ✅ Captura PDF pela rede (resolve “Salvar como” / inline / attachment / octet-stream)
     async function waitForPdfResponse(timeoutMs = 45000) {
       const resp = await page
         .waitForResponse(
@@ -220,6 +225,29 @@ app.post("/emitir-certidao", auth, async (req, res) => {
       return null;
     }
 
+    // ✅ NOVO: detecta o “Mensagem de Aviso / 023” e retorna o texto
+    async function handleAvisoIfPresent() {
+      const avisoTitle = page.locator("text=Mensagem de Aviso");
+      const avisoText = page.locator('text=Não foi possível concluir a ação');
+      const fecharBtn = page.getByRole("button", { name: /fechar/i });
+
+      const hasAviso =
+        (await avisoTitle.count().catch(() => 0)) > 0 ||
+        (await avisoText.count().catch(() => 0)) > 0;
+
+      if (!hasAviso) return null;
+
+      const bodyText = await page.textContent("body").catch(() => "");
+
+      // tenta fechar o modal para permitir retry
+      if ((await fecharBtn.count().catch(() => 0)) > 0) {
+        await fecharBtn.first().click({ timeout: 1500 }).catch(() => {});
+        await page.waitForTimeout(300);
+      }
+
+      return (bodyText || "").slice(0, 700);
+    }
+
     // ---------- execução ----------
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
@@ -230,176 +258,232 @@ app.post("/emitir-certidao", auth, async (req, res) => {
     await tryClickCookieButtons();
     await page.waitForTimeout(800);
 
-    // ======== BLOCO ROBUSTO (substitui o antigo page.fill + page.click) ========
-    const cnpjDigits = cnpj;
+    // ========= FUNÇÃO: uma tentativa completa =========
+    async function attemptOnce(attemptNo) {
+      // preencher CNPJ
+      const cnpjDigits = cnpj;
 
-    let cnpjInput = page.locator('input[placeholder*="CNPJ"]').first();
-    if ((await cnpjInput.count().catch(() => 0)) === 0) {
-      cnpjInput = page.locator('input[inputmode="numeric"]').first();
-    }
-    if ((await cnpjInput.count().catch(() => 0)) === 0) {
-      cnpjInput = page.locator("form input").first();
-    }
+      let cnpjInput = page.locator('input[placeholder*="CNPJ"]').first();
+      if ((await cnpjInput.count().catch(() => 0)) === 0) {
+        cnpjInput = page.locator('input[inputmode="numeric"]').first();
+      }
+      if ((await cnpjInput.count().catch(() => 0)) === 0) {
+        cnpjInput = page.locator("form input").first();
+      }
 
-    await cnpjInput.waitFor({ timeout: 20000 });
-    await cnpjInput.fill("");
-    await cnpjInput.type(cnpjDigits, { delay: 30 });
-    await cnpjInput.press("Tab").catch(() => {});
-    await page.waitForTimeout(400);
-
-    await tryClickCookieButtons();
-
-    const emitirBtn = page.getByRole("button", { name: /emitir certidão/i });
-    await emitirBtn.waitFor({ timeout: 20000 });
-    await emitirBtn.scrollIntoViewIfNeeded().catch(() => {});
-    await page.waitForTimeout(200);
-
-    const isDisabled =
-      (await emitirBtn.isDisabled().catch(() => false)) ||
-      (await emitirBtn.getAttribute("disabled").catch(() => null)) !== null;
-
-    if (isDisabled) {
-      await cnpjInput.focus().catch(() => {});
+      await cnpjInput.waitFor({ timeout: 20000 });
+      await cnpjInput.fill("");
+      await cnpjInput.type(cnpjDigits, { delay: 30 });
       await cnpjInput.press("Tab").catch(() => {});
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(400);
+
+      await tryClickCookieButtons();
+
+      const emitirBtn = page.getByRole("button", { name: /emitir certidão/i });
+      await emitirBtn.waitFor({ timeout: 20000 });
+      await emitirBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await page.waitForTimeout(200);
+
+      const isDisabled =
+        (await emitirBtn.isDisabled().catch(() => false)) ||
+        (await emitirBtn.getAttribute("disabled").catch(() => null)) !== null;
+
+      if (isDisabled) {
+        await cnpjInput.focus().catch(() => {});
+        await cnpjInput.press("Tab").catch(() => {});
+        await page.waitForTimeout(500);
+      }
+
+      // arma download automático
+      const dl1 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
+
+      // clica
+      await emitirBtn.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(800);
+
+      // ✅ verifica se apareceu “Mensagem de Aviso”
+      const aviso = await handleAvisoIfPresent();
+      if (aviso) {
+        return {
+          kind: "TEMP_AVISO",
+          aviso,
+          attemptNo,
+        };
+      }
+
+      // espera modal OU navegação
+      const modalPromise = page
+        .locator("text=Certidão Válida Encontrada")
+        .waitFor({ timeout: 15000 })
+        .then(() => "MODAL")
+        .catch(() => null);
+
+      const urlPromise = page
+        .waitForURL((u) => !u.toString().includes("#/home/cnpj"), { timeout: 15000 })
+        .then(() => "NAV")
+        .catch(() => null);
+
+      const outcome = await Promise.race([modalPromise, urlPromise]);
+
+      if (!outcome) {
+        return { kind: "NO_OUTCOME", attemptNo };
+      }
+
+      // modal?
+      const modalExists =
+        (await safeCount(page.locator("text=Certidão Válida Encontrada"))) > 0;
+
+      if (modalExists) {
+        await tryClickCookieButtons();
+
+        // 🔥 resolve "Salvar como": arma captura de PDF antes do clique
+        const pdfPromise = waitForPdfResponse(45000);
+
+        // ainda tenta download event
+        const dl2 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
+
+        await page.click('button:has-text("Emitir Nova Certidão")').catch(() => {});
+
+        await waitForResultPageOrPdfLink();
+        await tryClickCookieButtons();
+
+        const d2 = await dl2;
+        if (d2) {
+          return { kind: "DONE_DOWNLOAD", download: d2, msg: "Emitida via modal - download automático" };
+        }
+
+        const pdfBuf = await pdfPromise;
+        if (pdfBuf) {
+          return { kind: "DONE_BUFFER", buffer: pdfBuf, fileName: `Certidao-${cnpj}.pdf`, msg: "Emitida via modal - PDF capturado por response" };
+        }
+
+        const resultDl2 = await downloadFromResultPage();
+        if (resultDl2?.mode === "download") {
+          return { kind: "DONE_DOWNLOAD", download: resultDl2.download, msg: "Emitida via modal - download pelo link/resultado" };
+        }
+        if (resultDl2?.mode === "buffer") {
+          return { kind: "DONE_BUFFER", buffer: resultDl2.buffer, fileName: resultDl2.fileName, msg: "Emitida via modal - PDF capturado via link/resultado" };
+        }
+
+        // se não achou PDF, pode ser instabilidade
+        return { kind: "NO_PDF_AFTER_MODAL", attemptNo };
+      }
+
+      // sem modal: talvez download direto
+      const d1 = await dl1;
+      if (d1) {
+        return { kind: "DONE_DOWNLOAD", download: d1, msg: "Emitida - download automático" };
+      }
+
+      // tenta capturar PDF por response mesmo sem modal
+      await waitForResultPageOrPdfLink();
+      await tryClickCookieButtons();
+
+      const pdfBufNoModal = await waitForPdfResponse(25000);
+      if (pdfBufNoModal) {
+        return { kind: "DONE_BUFFER", buffer: pdfBufNoModal, fileName: `Certidao-${cnpj}.pdf`, msg: "Emitida - PDF capturado por response" };
+      }
+
+      const resultDl1 = await downloadFromResultPage();
+      if (resultDl1?.mode === "download") {
+        return { kind: "DONE_DOWNLOAD", download: resultDl1.download, msg: "Emitida - download pelo link/resultado" };
+      }
+      if (resultDl1?.mode === "buffer") {
+        return { kind: "DONE_BUFFER", buffer: resultDl1.buffer, fileName: resultDl1.fileName, msg: "Emitida - PDF capturado via link/resultado" };
+      }
+
+      return { kind: "NO_PDF", attemptNo };
     }
 
-    // ✅ dl1 tem que existir aqui (antes do clique), porque usamos depois
-    const dl1 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
+    // ========= LOOP DE RETRY =========
+    let lastTempAviso = null;
 
-    await emitirBtn.click({ force: true }).catch(() => {});
-    await page.waitForTimeout(800);
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const result = await attemptOnce(attempt);
 
-    const modalPromise = page
-      .locator("text=Certidão Válida Encontrada")
-      .waitFor({ timeout: 15000 })
-      .then(() => "MODAL")
-      .catch(() => null);
+      if (result.kind === "DONE_DOWNLOAD") {
+        return await respondWithDownload(result.download, result.msg);
+      }
 
-    const urlPromise = page
-      .waitForURL((u) => !u.toString().includes("#/home/cnpj"), { timeout: 15000 })
-      .then(() => "NAV")
-      .catch(() => null);
+      if (result.kind === "DONE_BUFFER") {
+        return await respondWithBuffer(result.buffer, result.fileName, result.msg);
+      }
 
-    const outcome = await Promise.race([modalPromise, urlPromise]);
+      if (result.kind === "TEMP_AVISO") {
+        lastTempAviso = result.aviso;
 
-    if (!outcome) {
+        // se ainda tem tentativa, espera e tenta novamente
+        if (attempt < MAX_ATTEMPTS) {
+          await page.waitForTimeout(RETRY_WAIT_MS);
+          continue;
+        }
+
+        // sem mais tentativas → devolve erro temporário
+        const currentUrl = page.url();
+        const pageTitle = await page.title().catch(() => "");
+        await browser.close();
+
+        return res.status(200).json({
+          status: "ERRO_TEMPORARIO",
+          message: "Receita retornou 'Mensagem de Aviso' (tente novamente em alguns minutos).",
+          fileName: "",
+          pdfBase64: "",
+          currentUrl,
+          pageTitle,
+          debugSnippet: lastTempAviso,
+        });
+      }
+
+      // sem aviso, mas não saiu coisa nenhuma → não adianta retry longo
+      // devolve diagnóstico e encerra
+      if (result.kind === "NO_OUTCOME") {
+        const currentUrl = page.url();
+        const pageTitle = await page.title().catch(() => "");
+        const bodyText = await page.textContent("body").catch(() => "");
+        await browser.close();
+
+        return res.status(200).json({
+          status: "NAO_EMITIDA",
+          message: "Não conseguiu acionar o clique em 'Emitir Certidão' (sem modal e sem navegação).",
+          fileName: "",
+          pdfBase64: "",
+          currentUrl,
+          pageTitle,
+          debugSnippet: (bodyText || "").slice(0, 2000),
+        });
+      }
+
+      // outros casos: pode ser instabilidade, mas sem aviso explícito
+      // não retry aqui para não ficar lento demais; devolve diagnóstico
       const currentUrl = page.url();
       const pageTitle = await page.title().catch(() => "");
-      const inputVal = await cnpjInput.inputValue().catch(() => "");
-      const btnDisabled2 = await emitirBtn.isDisabled().catch(() => null);
       const bodyText = await page.textContent("body").catch(() => "");
-
       await browser.close();
+
       return res.status(200).json({
         status: "NAO_EMITIDA",
-        message: "Não conseguiu acionar o clique em 'Emitir Certidão' (sem modal e sem navegação).",
+        message: "Sem download do PDF (pode haver pendência/débito, cookies bloqueando ou fluxo diferente)",
         fileName: "",
         pdfBase64: "",
         currentUrl,
         pageTitle,
-        debug: { inputVal, btnDisabled: btnDisabled2 },
         debugSnippet: (bodyText || "").slice(0, 2000),
       });
     }
-    // ======== FIM DO BLOCO ROBUSTO ========
 
-    // modal “Certidão Válida Encontrada”
-    const modalExists =
-      (await safeCount(page.locator("text=Certidão Válida Encontrada"))) > 0;
-
-    if (modalExists) {
-      await tryClickCookieButtons();
-
-      // ✅ arma captura de PDF antes do clique (resolve "Salvar como")
-      const pdfPromise = waitForPdfResponse(45000);
-
-      // ainda tentamos download event
-      const dl2 = page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
-
-      await page.click('button:has-text("Emitir Nova Certidão")').catch(() => {});
-
-      await waitForResultPageOrPdfLink();
-      await tryClickCookieButtons();
-
-      const d2 = await dl2;
-      if (d2) {
-        return await respondWithDownload(
-          d2,
-          "Emitida via modal (Emitir Nova Certidão) - download automático"
-        );
-      }
-
-      const pdfBuf = await pdfPromise;
-      if (pdfBuf) {
-        return await respondWithBuffer(
-          pdfBuf,
-          `Certidao-${cnpj}.pdf`,
-          "Emitida via modal (Emitir Nova Certidão) - PDF capturado por response"
-        );
-      }
-
-      const resultDl2 = await downloadFromResultPage();
-      if (resultDl2?.mode === "download") {
-        return await respondWithDownload(
-          resultDl2.download,
-          "Emitida via modal - download pelo link/resultado"
-        );
-      }
-      if (resultDl2?.mode === "buffer") {
-        return await respondWithBuffer(
-          resultDl2.buffer,
-          resultDl2.fileName,
-          "Emitida via modal - PDF capturado via link/resultado"
-        );
-      }
-    }
-
-    // fluxo sem modal: se baixou automático ao clicar Emitir Certidão
-    const d1 = await dl1;
-    if (d1) return await respondWithDownload(d1, "Emitida - download automático");
-
-    await waitForResultPageOrPdfLink();
-    await tryClickCookieButtons();
-
-    const pdfBufNoModal = await waitForPdfResponse(25000);
-    if (pdfBufNoModal) {
-      return await respondWithBuffer(
-        pdfBufNoModal,
-        `Certidao-${cnpj}.pdf`,
-        "Emitida - PDF capturado por response"
-      );
-    }
-
-    const resultDl1 = await downloadFromResultPage();
-    if (resultDl1?.mode === "download")
-      return await respondWithDownload(
-        resultDl1.download,
-        "Emitida - download pelo link/resultado"
-      );
-    if (resultDl1?.mode === "buffer")
-      return await respondWithBuffer(
-        resultDl1.buffer,
-        resultDl1.fileName,
-        "Emitida - PDF capturado via link/resultado"
-      );
-
-    // diagnóstico final
-    const bodyText = await page.textContent("body").catch(() => "");
+    // fallback (não deveria chegar aqui)
     const currentUrl = page.url();
     const pageTitle = await page.title().catch(() => "");
     await browser.close();
-
     return res.status(200).json({
       status: "NAO_EMITIDA",
-      message:
-        "Sem download do PDF (pode haver pendência/débito, cookies bloqueando ou fluxo diferente)",
+      message: "Sem download do PDF (fallback).",
       fileName: "",
       pdfBase64: "",
       currentUrl,
       pageTitle,
-      debugSnippet: (bodyText || "").slice(0, 2000),
     });
+
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ status: "ERRO", message: e.message });
